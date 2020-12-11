@@ -26,10 +26,14 @@ import javax.security.auth.login.AppConfigurationEntry;
 import javax.security.auth.login.Configuration;
 import javax.security.auth.login.LoginContext;
 import javax.security.auth.login.LoginException;
+import java.security.PrivilegedAction;
 import java.util.Date;
 import java.util.Map;
 import java.util.Random;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
  * This class is responsible for logging in to Kerberos and refreshing credentials for
@@ -61,6 +65,22 @@ public class KerberosLogin extends AbstractLogin {
     // Change the '1' to e.g. 5, to change this to 5 minutes.
     private long minTimeBeforeRelogin = 1 * 60 * 1000;
     private String kinitCmd = "/usr/bin/kinit";
+    private ReentrantReadWriteLock tgtRenewalLock;
+    private long tgtRenewalTimeoutMS;
+
+    private static final long DEFAULT_TGT_RENEWAL_TIMEOUT_MS = 3 * 60 * 1000;
+
+    public KerberosLogin() {
+        this.tgtRenewalLock = new ReentrantReadWriteLock(true);
+        this.tgtRenewalTimeoutMS = DEFAULT_TGT_RENEWAL_TIMEOUT_MS;
+    }
+
+    public KerberosLogin(long tgtRenewalTimeoutMS) {
+        this.tgtRenewalLock = new ReentrantReadWriteLock(true);
+        this.tgtRenewalTimeoutMS = tgtRenewalTimeoutMS;
+    }
+
+
 
     /**
      * Method to configure this instance with specific properties
@@ -147,7 +167,7 @@ public class KerberosLogin extends AbstractLogin {
         }
     }
 
-    private void spawnReloginThread () {
+    private void spawnReloginThread() {
         // Refresh the Ticket Granting Ticket (TGT) periodically. How often to refresh is determined by the
         // TGT's existing expiry date and the configured minTimeBeforeRelogin. For testing and development,
         // you can decrease the interval of expiration of tickets (for example, to 3 minutes) by running:
@@ -219,6 +239,25 @@ public class KerberosLogin extends AbstractLogin {
         t.start();
     }
 
+    public <T> T doAction(PrivilegedAction<T> action) throws LoginException {
+        Lock readLock = tgtRenewalLock.readLock();
+        try {
+            if (readLock.tryLock(tgtRenewalTimeoutMS, TimeUnit.MILLISECONDS)) {
+                T result;
+                try {
+                    result = super.doAction(action);
+                } finally {
+                    readLock.unlock();
+                }
+                return result;
+            } else {
+                throw new LoginException("Timed out while the client was waiting for Kerberos TGT renewal");
+            }
+        } catch (InterruptedException e) {
+            throw new LoginException("Error while the client was waiting for Kerberos TGT renewal : " + e.getLocalizedMessage());
+        }
+    }
+
     private long getRefreshTime(KerberosTicket tgt) {
         long start = tgt.getStartTime().getTime();
         long expires = tgt.getEndTime().getTime();
@@ -251,17 +290,25 @@ public class KerberosLogin extends AbstractLogin {
      * @throws javax.security.auth.login.LoginException on a failure
      */
     private void reLogin() throws LoginException {
-        log.info("Initiating logout for {}", principal);
-        //clear up the kerberos state. But the tokens are not cleared! As per
-        //the Java kerberos login module code, only the kerberos credentials
-        //are cleared
-        loginContext.logout();
-        //login and also update the subject field of the original LoginContext to
-        //have the new credentials (pass it to the LoginContext constructor)
-        loginContext = new LoginContext(loginContextName, loginContext.getSubject());
-        log.info("Initiating re-login for {}", principal);
-        loginContext.login();
-        log.info("Successfully logged in from auto relogin thread");
+        Lock writeLock = tgtRenewalLock.writeLock();
+        try {
+            if (writeLock.tryLock(tgtRenewalTimeoutMS, TimeUnit.MILLISECONDS)) {
+                try {
+                    log.info("Initiating logout for {}", principal);
+                    loginContext.logout();
+                    loginContext = new LoginContext(loginContextName, loginContext.getSubject());
+                    log.info("Initiating re-login for {}", principal);
+                    loginContext.login();
+                    log.info("Successfully logged in from auto relogin thread");
+                } finally {
+                    writeLock.unlock();
+                }
+            } else {
+                throw new LoginException("Timed out while waiting to acquire a lock for renewing Kerberos TGT");
+            }
+        } catch (InterruptedException e) {
+            throw new LoginException("Error while acquiring lock for renewing Kerberos TGT : " + e.getMessage());
+        }
     }
 
 
